@@ -1,0 +1,15 @@
+# Data files
+cumulative_koi.csv
+*.npz
+
+# Pipeline outputs
+koi_pipeline_output/
+
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# OS-specific junk
+.DS_Store
+Thumbs.db
