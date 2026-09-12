@@ -7,31 +7,19 @@ Combines three stages that can be run independently or together:
                  (KNN, SVM, Random Forest, Gradient Boosting, XGBoost).
   2. LIGHTCURVE — downloads raw Kepler light curves from MAST via `lightkurve`,
                  flattens, phase-folds, and bins them into global/local views.
-                 REQUIRES OPEN INTERNET to archive.stsci.edu — run this stage on
-                 your own machine or in Colab, not in a network-sandboxed environment.
+        
   3. HYBRID    — trains a three-branch CNN (global view + local view + tabular
                  features) using the outputs of stage 1's feature set and stage 2's
-                 light curve arrays. Implemented in PyTorch (not TensorFlow), so it
-                 works fine on newer Python versions TensorFlow hasn't caught up to yet.
+                 light curve arrays.
 
 Usage
 -----
     # Tabular-only comparison
     python koi_pipeline.py --stage tabular --data cumulative_koi.csv
 
-    # Download + preprocess light curves (run where MAST is reachable)
-    python koi_pipeline.py --stage lightcurve --data cumulative_koi.csv --limit 500
-
-    # Train the hybrid model on preprocessed light curve data
-    python koi_pipeline.py --stage hybrid --lightcurve-data koi_lightcurve_data.npz
-
-    # Run everything in sequence (lightcurve stage will fail without MAST access)
-    python koi_pipeline.py --stage all --data cumulative_koi.csv
-
 Get the cumulative KOI table from:
     https://exoplanetarchive.ipac.caltech.edu/cgi-bin/TblView/nph-tblView?app=ExoTbls&config=cumulative
 """
-
 import argparse
 import os
 import sys
