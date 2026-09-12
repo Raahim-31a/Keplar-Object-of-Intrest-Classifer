@@ -1,0 +1,609 @@
+"""
+koi_pipeline.py — End-to-end Kepler Object of Interest (KOI) classification pipeline.
+
+Combines three stages that can be run independently or together:
+
+  1. TABULAR   — classical ML on summary features from the cumulative KOI table
+                 (KNN, SVM, Random Forest, Gradient Boosting, XGBoost).
+  2. LIGHTCURVE — downloads raw Kepler light curves from MAST via `lightkurve`,
+                 flattens, phase-folds, and bins them into global/local views.
+                 REQUIRES OPEN INTERNET to archive.stsci.edu — run this stage on
+                 your own machine or in Colab, not in a network-sandboxed environment.
+  3. HYBRID    — trains a three-branch CNN (global view + local view + tabular
+                 features) using the outputs of stage 1's feature set and stage 2's
+                 light curve arrays. Implemented in PyTorch (not TensorFlow), so it
+                 works fine on newer Python versions TensorFlow hasn't caught up to yet.
+
+Usage
+-----
+    # Tabular-only comparison
+    python koi_pipeline.py --stage tabular --data cumulative_koi.csv
+
+    # Download + preprocess light curves (run where MAST is reachable)
+    python koi_pipeline.py --stage lightcurve --data cumulative_koi.csv --limit 500
+
+    # Train the hybrid model on preprocessed light curve data
+    python koi_pipeline.py --stage hybrid --lightcurve-data koi_lightcurve_data.npz
+
+    # Run everything in sequence (lightcurve stage will fail without MAST access)
+    python koi_pipeline.py --stage all --data cumulative_koi.csv
+
+Get the cumulative KOI table from:
+    https://exoplanetarchive.ipac.caltech.edu/cgi-bin/TblView/nph-tblView?app=ExoTbls&config=cumulative
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+TARGET_COL = "koi_disposition"
+
+TABULAR_FEATURES = [
+    "koi_period", "koi_duration", "koi_depth", "koi_impact",   # transit shape
+    "koi_prad", "koi_teq", "koi_insol",                        # derived planet properties
+    "koi_model_snr",                                            # signal quality
+    "koi_steff", "koi_slogg", "koi_srad",                       # stellar host params
+]
+
+# Excluded on purpose: these are outputs of NASA's own Robovetter classifier.
+# Training on them means imitating Robovetter's decision, not classifying
+# independently from raw transit/stellar parameters.
+LEAKAGE_COLS = ["koi_score", "koi_fpflag_nt", "koi_fpflag_ss", "koi_fpflag_co", "koi_fpflag_ec"]
+
+GLOBAL_BINS = 2001
+LOCAL_BINS = 201
+LOCAL_WINDOW_DURATIONS = 2.0  # local view spans +/- this many transit durations
+
+
+# =====================================================================
+# Stage 1 — Tabular models
+# =====================================================================
+
+def load_tabular_data(path):
+    df = pd.read_csv(path, comment="#")
+    missing_cols = set([TARGET_COL] + TABULAR_FEATURES) - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"Input CSV is missing expected columns: {missing_cols}")
+    assert not set(TABULAR_FEATURES) & set(LEAKAGE_COLS), "Leakage column found in feature list!"
+    return df[[TARGET_COL] + TABULAR_FEATURES].copy()
+
+
+def build_tabular_models():
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.svm import SVC
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+
+    models = {
+        "KNN": KNeighborsClassifier(n_neighbors=15, weights="distance"),
+        "SVM (RBF)": SVC(kernel="rbf", class_weight="balanced", random_state=RANDOM_STATE),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=300, class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1
+        ),
+        "Gradient Boosting": GradientBoostingClassifier(random_state=RANDOM_STATE),
+    }
+    try:
+        from xgboost import XGBClassifier
+        models["XGBoost"] = XGBClassifier(
+            n_estimators=300, learning_rate=0.1, max_depth=5,
+            random_state=RANDOM_STATE, eval_metric="mlogloss",
+        )
+    except ImportError:
+        print("xgboost not installed — skipping. `pip install xgboost` to include it.")
+    return models
+
+
+def run_tabular_stage(data_path, output_dir):
+    from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+    from sklearn.preprocessing import StandardScaler, LabelEncoder
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import (classification_report, f1_score, accuracy_score,
+                                  ConfusionMatrixDisplay)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"\n=== STAGE 1: TABULAR ===\nLoading {data_path}")
+    df = load_tabular_data(data_path)
+    print(df[TARGET_COL].value_counts())
+
+    X = df[TABULAR_FEATURES]
+    le = LabelEncoder()
+    y = le.fit_transform(df[TARGET_COL])
+    print("Label mapping:", dict(zip(le.classes_, range(len(le.classes_)))))
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    )
+
+    imputer = SimpleImputer(strategy="median")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(imputer.fit_transform(X_train))
+    X_test_scaled = scaler.transform(imputer.transform(X_test))
+
+    models = build_tabular_models()
+    results = {}
+    fitted_models = {}
+
+    for name, model in models.items():
+        model.fit(X_train_scaled, y_train)
+        preds = model.predict(X_test_scaled)
+        fitted_models[name] = model
+        results[name] = {
+            "accuracy": accuracy_score(y_test, preds),
+            "macro_f1": f1_score(y_test, preds, average="macro"),
+            "weighted_f1": f1_score(y_test, preds, average="weighted"),
+        }
+
+    results_df = pd.DataFrame(results).T.sort_values("macro_f1", ascending=False)
+    print("\nHeld-out test set comparison:")
+    print(results_df.round(4))
+    results_df.to_csv(os.path.join(output_dir, "tabular_model_comparison.csv"))
+
+    # 5-fold cross-validated comparison, more stable under class imbalance
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    X_all_scaled = scaler.fit_transform(imputer.fit_transform(X))
+    cv_scores = {
+        name: cross_val_score(model, X_all_scaled, y, cv=cv, scoring="f1_macro", n_jobs=-1)
+        for name, model in models.items()
+    }
+    cv_df = pd.DataFrame(cv_scores)
+    print("\n5-fold CV macro-F1 (mean):")
+    print(cv_df.mean().sort_values(ascending=False).round(4))
+
+    best_name = results_df.index[0]
+    best_model = fitted_models[best_name]
+    preds = best_model.predict(X_test_scaled)
+    y_test_labels = le.inverse_transform(y_test)
+    preds_labels = le.inverse_transform(preds)
+
+    print(f"\nBest model: {best_name}\n")
+    print(classification_report(y_test_labels, preds_labels))
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ConfusionMatrixDisplay.from_predictions(
+        y_test_labels, preds_labels, ax=ax, cmap="Blues", xticks_rotation=45
+    )
+    ax.set_title(f"Confusion matrix — {best_name}")
+    plt.tight_layout()
+    fig.savefig(os.path.join(output_dir, "tabular_confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+
+    print(f"\nSaved results to {output_dir}/tabular_model_comparison.csv and tabular_confusion_matrix.png")
+    return results_df, fitted_models, (le, imputer, scaler)
+
+
+# =====================================================================
+# Stage 2 — Light curve download + preprocessing
+# =====================================================================
+
+def download_and_fold(kepid, period, epoch, duration_hours):
+    """Download all quarters for a KIC, stitch, flatten, and phase-fold.
+
+    Returns the folded lightkurve.FoldedLightCurve object, or None on failure.
+    Requires open internet access to MAST — not runnable in a sandboxed
+    environment without egress to archive.stsci.edu.
+    """
+    import lightkurve as lk
+
+    try:
+        search = lk.search_lightcurve(f"KIC {kepid}", mission="Kepler", author="Kepler")
+        lc_collection = search.download_all()
+        if lc_collection is None or len(lc_collection) == 0:
+            return None
+        lc = lc_collection.stitch().remove_nans()
+
+        duration_days = duration_hours / 24.0
+        mask = lc.create_transit_mask(period=period, transit_time=epoch, duration=duration_days)
+        flat_lc = lc.flatten(window_length=901, mask=mask)
+        return flat_lc.fold(period=period, epoch_time=epoch)
+    except Exception as e:
+        print(f"  [{kepid}] failed: {e}")
+        return None
+
+
+def bin_view(folded, n_bins, phase_min, phase_max):
+    """Median-bin a folded light curve's flux into n_bins over [phase_min, phase_max].
+
+    Empty bins are filled with the global median flux.
+    """
+    phase = folded.phase.value
+    flux = folded.flux.value
+
+    in_range = (phase >= phase_min) & (phase <= phase_max)
+    phase, flux = phase[in_range], flux[in_range]
+
+    bin_edges = np.linspace(phase_min, phase_max, n_bins + 1)
+    bin_indices = np.clip(np.digitize(phase, bin_edges) - 1, 0, n_bins - 1)
+
+    binned = np.full(n_bins, np.nan)
+    for i in range(n_bins):
+        vals = flux[bin_indices == i]
+        if len(vals) > 0:
+            binned[i] = np.median(vals)
+
+    global_median = np.nanmedian(binned)
+    return np.where(np.isnan(binned), global_median, binned)
+
+
+def make_views(folded, period_days, duration_hours):
+    """Build the global view (full phase range) and local view (zoomed on transit)."""
+    global_view = bin_view(folded, GLOBAL_BINS, -0.5, 0.5)
+
+    duration_days = duration_hours / 24.0
+    half_window = LOCAL_WINDOW_DURATIONS * duration_days / period_days
+    local_view = bin_view(folded, LOCAL_BINS, -half_window, half_window)
+
+    return global_view.astype(np.float32), local_view.astype(np.float32)
+
+
+def run_lightcurve_stage(data_path, output_path, limit=None, checkpoint_every=50):
+    print("\n=== STAGE 2: LIGHT CURVE DOWNLOAD + PREPROCESSING ===")
+    print("NOTE: requires open internet access to archive.stsci.edu (MAST).")
+
+    koi_df = pd.read_csv(data_path, comment="#")
+    if limit:
+        koi_df = koi_df.sample(min(limit, len(koi_df)), random_state=RANDOM_STATE)
+
+    global_views, local_views, tabular_rows, labels, kepids_used = [], [], [], [], []
+
+    for _, row in koi_df.iterrows():
+        kepid, period, epoch, duration_hours = (
+            row["kepid"], row["koi_period"], row["koi_time0bk"], row["koi_duration"]
+        )
+        if pd.isna(period) or pd.isna(epoch) or pd.isna(duration_hours):
+            continue
+
+        print(f"Processing KIC {kepid} ...")
+        folded = download_and_fold(kepid, period, epoch, duration_hours)
+        if folded is None:
+            continue
+
+        try:
+            g_view, l_view = make_views(folded, period, duration_hours)
+        except Exception as e:
+            print(f"  [{kepid}] binning failed: {e}")
+            continue
+
+        global_views.append(g_view)
+        local_views.append(l_view)
+        tabular_rows.append(row[TABULAR_FEATURES].values.astype(np.float32))
+        labels.append(row[TARGET_COL])
+        kepids_used.append(kepid)
+
+        if len(kepids_used) % checkpoint_every == 0:
+            checkpoint_path = output_path.replace(".npz", "_checkpoint.npz")
+            np.savez(
+                checkpoint_path,
+                global_views=np.array(global_views), local_views=np.array(local_views),
+                tabular=np.array(tabular_rows), labels=np.array(labels), kepids=np.array(kepids_used),
+            )
+            print(f"  checkpoint saved at {len(kepids_used)} targets -> {checkpoint_path}")
+
+    np.savez(
+        output_path,
+        global_views=np.array(global_views), local_views=np.array(local_views),
+        tabular=np.array(tabular_rows), labels=np.array(labels), kepids=np.array(kepids_used),
+    )
+    print(f"Done. Processed {len(kepids_used)} of {len(koi_df)} KOIs successfully -> {output_path}")
+    return output_path
+
+
+# =====================================================================
+# Stage 3 — Hybrid model (tabular + light curve branches)
+# =====================================================================
+
+def _build_conv_branch_module(torch, nn):
+    class ConvBranchModule(nn.Module):
+        """One Conv1D tower for a single light curve view (global or local).
+
+        Three conv -> ReLU -> pool blocks, doubling channels each time, then a
+        global max pool and two dense layers down to a compact feature vector.
+        Mirrors the Keras conv_branch() helper from the TensorFlow version.
+        """
+
+        def __init__(self, input_length):
+            super().__init__()
+            self.conv1 = nn.Conv1d(1, 16, kernel_size=5, padding=2)
+            self.pool1 = nn.MaxPool1d(kernel_size=5, stride=2)
+            self.conv2 = nn.Conv1d(16, 32, kernel_size=5, padding=2)
+            self.pool2 = nn.MaxPool1d(kernel_size=5, stride=2)
+            self.conv3 = nn.Conv1d(32, 64, kernel_size=5, padding=2)
+            self.dense = nn.Linear(64, 64)
+            self.dropout = nn.Dropout(0.3)
+            self.relu = nn.ReLU()
+
+        def forward(self, x):
+            # x arrives as (batch, timesteps) -> add channel dim -> (batch, 1, timesteps)
+            x = x.unsqueeze(1)
+            x = self.pool1(self.relu(self.conv1(x)))
+            x = self.pool2(self.relu(self.conv2(x)))
+            x = self.relu(self.conv3(x))
+            x = torch.amax(x, dim=2)  # GlobalMaxPooling1D equivalent
+            x = self.relu(self.dense(x))
+            x = self.dropout(x)
+            return x
+
+    return ConvBranchModule
+
+
+def build_hybrid_model(n_classes):
+    """Build the three-branch hybrid model (global CNN + local CNN + tabular dense)
+    using PyTorch instead of Keras/TensorFlow. Same architecture and layer sizes
+    as the TensorFlow version — only the framework changed.
+    """
+    import torch
+    import torch.nn as nn
+
+    ConvBranchModule = _build_conv_branch_module(torch, nn)
+
+    class HybridKOIClassifier(nn.Module):
+        def __init__(self, n_classes):
+            super().__init__()
+            self.global_branch = ConvBranchModule(GLOBAL_BINS)
+            self.local_branch = ConvBranchModule(LOCAL_BINS)
+
+            self.tabular_fc1 = nn.Linear(len(TABULAR_FEATURES), 32)
+            self.tabular_dropout1 = nn.Dropout(0.2)
+            self.tabular_fc2 = nn.Linear(32, 16)
+
+            self.merged_fc = nn.Linear(64 + 64 + 16, 64)
+            self.merged_dropout = nn.Dropout(0.3)
+            self.output_fc = nn.Linear(64, n_classes)
+
+            self.relu = nn.ReLU()
+
+        def forward(self, global_view, local_view, tabular):
+            g = self.global_branch(global_view)
+            l = self.local_branch(local_view)
+
+            t = self.relu(self.tabular_fc1(tabular))
+            t = self.tabular_dropout1(t)
+            t = self.relu(self.tabular_fc2(t))
+
+            merged = torch.cat([g, l, t], dim=1)
+            x = self.relu(self.merged_fc(merged))
+            x = self.merged_dropout(x)
+            # Return raw logits — nn.CrossEntropyLoss applies softmax internally
+            return self.output_fc(x)
+
+    return HybridKOIClassifier(n_classes)
+
+
+def _make_synthetic_lightcurve_data(n=1500):
+    global_views = np.random.normal(1.0, 0.01, size=(n, GLOBAL_BINS)).astype(np.float32)
+    local_views = np.random.normal(1.0, 0.01, size=(n, LOCAL_BINS)).astype(np.float32)
+    labels = np.random.choice(["CONFIRMED", "CANDIDATE", "FALSE POSITIVE"], n, p=[0.25, 0.25, 0.5])
+    is_planet_like = labels != "FALSE POSITIVE"
+    center = LOCAL_BINS // 2
+    local_views[is_planet_like, center - 10:center + 10] -= 0.005
+    tabular = np.column_stack([
+        np.random.exponential(20, n), np.random.exponential(5, n),
+        np.random.exponential(500, n), np.random.uniform(0, 1, n),
+        np.random.exponential(3, n), np.random.uniform(200, 2000, n),
+        np.random.exponential(100, n), np.random.exponential(20, n),
+        np.random.normal(5700, 500, n), np.random.normal(4.4, 0.2, n),
+        np.random.exponential(1, n),
+    ]).astype(np.float32)
+    return global_views, local_views, tabular, labels
+
+
+def run_hybrid_stage(lightcurve_data_path, output_dir, epochs=50):
+    """PyTorch version of the hybrid stage. Same data flow, splits, scaling,
+    and architecture as the TensorFlow version — the only real differences are
+    an explicit training loop (Keras's .fit() does this for you internally)
+    and manual early stopping (Keras's EarlyStopping callback equivalent).
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import TensorDataset, DataLoader
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler, LabelEncoder
+    from sklearn.metrics import classification_report, ConfusionMatrixDisplay
+    from sklearn.utils.class_weight import compute_class_weight
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(output_dir, exist_ok=True)
+    torch.manual_seed(RANDOM_STATE)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n=== STAGE 3: HYBRID MODEL (PyTorch, device={device}) ===")
+
+    if lightcurve_data_path and os.path.exists(lightcurve_data_path):
+        data = np.load(lightcurve_data_path, allow_pickle=True)
+        global_views, local_views, tabular, labels = (
+            data["global_views"], data["local_views"], data["tabular"], data["labels"]
+        )
+        print(f"Loaded real light curve data: {len(labels)} examples")
+    else:
+        print("No light curve data found — using synthetic data to validate the pipeline.")
+        global_views, local_views, tabular, labels = _make_synthetic_lightcurve_data()
+
+    le = LabelEncoder()
+    y = le.fit_transform(labels)
+    n_classes = len(le.classes_)
+    print("Classes:", dict(zip(le.classes_, range(n_classes))))
+
+    idx = np.arange(len(y))
+    train_idx, test_idx = train_test_split(
+        idx, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    )
+    # Carve a validation split out of the training portion, same as Keras's
+    # validation_split=0.15 did — stratified so class balance holds in both.
+    train_idx, val_idx = train_test_split(
+        train_idx, test_size=0.15, random_state=RANDOM_STATE, stratify=y[train_idx]
+    )
+
+    def split(arr, indices):
+        return arr[indices]
+
+    g_train, g_val, g_test = (split(global_views, i) for i in (train_idx, val_idx, test_idx))
+    l_train, l_val, l_test = (split(local_views, i) for i in (train_idx, val_idx, test_idx))
+    t_train, t_val, t_test = (split(tabular, i) for i in (train_idx, val_idx, test_idx))
+    y_train, y_val, y_test = y[train_idx], y[val_idx], y[test_idx]
+
+    scaler = StandardScaler()
+    t_train_scaled = scaler.fit_transform(np.nan_to_num(t_train, nan=0.0))
+    t_val_scaled = scaler.transform(np.nan_to_num(t_val, nan=0.0))
+    t_test_scaled = scaler.transform(np.nan_to_num(t_test, nan=0.0))
+
+    def to_tensor(arr, dtype=torch.float32):
+        return torch.tensor(arr, dtype=dtype)
+
+    train_ds = TensorDataset(
+        to_tensor(g_train), to_tensor(l_train), to_tensor(t_train_scaled), to_tensor(y_train, torch.long)
+    )
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+
+    g_val_t = to_tensor(g_val).to(device)
+    l_val_t = to_tensor(l_val).to(device)
+    t_val_t = to_tensor(t_val_scaled).to(device)
+    y_val_t = to_tensor(y_val, torch.long).to(device)
+
+    model = build_hybrid_model(n_classes).to(device)
+    print(model)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Total params: {n_params:,}")
+
+    class_weights = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
+    class_weights_t = to_tensor(class_weights).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights_t)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Manual early stopping: track best val loss, restore best weights, stop
+    # after `patience` epochs with no improvement — mirrors Keras's callback.
+    patience = 8
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    best_state = None
+    history = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss, running_correct, running_total = 0.0, 0, 0
+        for g_batch, l_batch, t_batch, y_batch in train_loader:
+            g_batch, l_batch = g_batch.to(device), l_batch.to(device)
+            t_batch, y_batch = t_batch.to(device), y_batch.to(device)
+
+            optimizer.zero_grad()
+            logits = model(g_batch, l_batch, t_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * y_batch.size(0)
+            running_correct += (logits.argmax(dim=1) == y_batch).sum().item()
+            running_total += y_batch.size(0)
+
+        train_loss = running_loss / running_total
+        train_acc = running_correct / running_total
+
+        model.eval()
+        with torch.no_grad():
+            val_logits = model(g_val_t, l_val_t, t_val_t)
+            val_loss = criterion(val_logits, y_val_t).item()
+            val_acc = (val_logits.argmax(dim=1) == y_val_t).float().mean().item()
+
+        history["loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["accuracy"].append(train_acc)
+        history["val_accuracy"].append(val_acc)
+        print(f"Epoch {epoch+1}/{epochs} - loss: {train_loss:.4f} - accuracy: {train_acc:.4f} "
+              f"- val_loss: {val_loss:.4f} - val_accuracy: {val_acc:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"Early stopping at epoch {epoch+1} (no val_loss improvement for {patience} epochs)")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)  # restore_best_weights equivalent
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(history["loss"], label="train")
+    axes[0].plot(history["val_loss"], label="val")
+    axes[0].set_title("Loss"); axes[0].legend()
+    axes[1].plot(history["accuracy"], label="train")
+    axes[1].plot(history["val_accuracy"], label="val")
+    axes[1].set_title("Accuracy"); axes[1].legend()
+    plt.tight_layout()
+    fig.savefig(os.path.join(output_dir, "hybrid_training_curves.png"), dpi=150)
+    plt.close(fig)
+
+    model.eval()
+    with torch.no_grad():
+        g_test_t = to_tensor(g_test).to(device)
+        l_test_t = to_tensor(l_test).to(device)
+        t_test_t = to_tensor(t_test_scaled).to(device)
+        test_logits = model(g_test_t, l_test_t, t_test_t)
+        preds = test_logits.argmax(dim=1).cpu().numpy()
+
+    y_test_labels = le.inverse_transform(y_test)
+    preds_labels = le.inverse_transform(preds)
+
+    print("\nHeld-out test set report:")
+    print(classification_report(y_test_labels, preds_labels))
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ConfusionMatrixDisplay.from_predictions(
+        y_test_labels, preds_labels, ax=ax, cmap="Blues", xticks_rotation=45
+    )
+    ax.set_title("Confusion matrix — hybrid model")
+    plt.tight_layout()
+    fig.savefig(os.path.join(output_dir, "hybrid_confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+
+    torch.save(model.state_dict(), os.path.join(output_dir, "hybrid_koi_model.pt"))
+    print(f"\nSaved model + plots to {output_dir}/")
+    return model
+
+
+# =====================================================================
+# CLI
+# =====================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Kepler KOI classification pipeline")
+    parser.add_argument(
+        "--stage", choices=["tabular", "lightcurve", "hybrid", "all"], required=True,
+        help="Which stage to run.",
+    )
+    parser.add_argument("--data", default="cumulative_koi.csv",
+                        help="Path to the cumulative KOI CSV (tabular/lightcurve stages).")
+    parser.add_argument("--lightcurve-out", default="koi_lightcurve_data.npz",
+                        help="Where to save preprocessed light curve arrays (lightcurve stage).")
+    parser.add_argument("--lightcurve-data", default="koi_lightcurve_data.npz",
+                        help="Preprocessed light curve .npz to load (hybrid stage). "
+                             "Falls back to synthetic data if not found.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Only process this many KOIs (lightcurve stage) — useful for a quick test run.")
+    parser.add_argument("--epochs", type=int, default=50, help="Training epochs (hybrid stage).")
+    parser.add_argument("--output-dir", default="koi_pipeline_output",
+                         help="Directory to save comparison tables, plots, and the trained model.")
+    args = parser.parse_args()
+
+    if args.stage in ("tabular", "all"):
+        run_tabular_stage(args.data, args.output_dir)
+
+    if args.stage in ("lightcurve", "all"):
+        run_lightcurve_stage(args.data, args.lightcurve_out, limit=args.limit)
+
+    if args.stage in ("hybrid", "all"):
+        lc_path = args.lightcurve_out if args.stage == "all" else args.lightcurve_data
+        run_hybrid_stage(lc_path, args.output_dir, epochs=args.epochs)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
